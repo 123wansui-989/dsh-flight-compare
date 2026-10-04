@@ -1,0 +1,4 @@
+# Deliver a flat node_modules: the harness resolves this plugin's ESM imports
+# from a real directory, not through a pnpm symlink farm.
+nodeLinker: hoisted
+storeDir: .pnpm-home/store

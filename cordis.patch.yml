@@ -1,0 +1,7 @@
+- insert:
+    - id: dsh-flight-compare
+      name: dsh-flight-compare
+      config:
+        token: !!js process.env.TRAVELPAYOUTS_TOKEN
+        currency: USD
+        maxRows: 30
