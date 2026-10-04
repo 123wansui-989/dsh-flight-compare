@@ -2,6 +2,9 @@
     - id: dsh-flight-compare
       name: dsh-flight-compare
       config:
-        token: !!js process.env.TRAVELPAYOUTS_TOKEN
+        travelpayoutsToken: !!js process.env.TRAVELPAYOUTS_TOKEN
+        amadeusClientId: !!js process.env.AMADEUS_CLIENT_ID
+        amadeusClientSecret: !!js process.env.AMADEUS_CLIENT_SECRET
+        amadeusProduction: !!js process.env.AMADEUS_PRODUCTION === 'true'
         currency: USD
         maxRows: 30

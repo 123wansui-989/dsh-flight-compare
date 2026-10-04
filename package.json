@@ -1,9 +1,9 @@
 {
   "name": "dsh-flight-compare",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "DSH plugin that compares cached flight prices from Travelpayouts.",
+  "description": "DSH plugin that compares flight prices across Travelpayouts and Amadeus.",
   "exports": {
     ".": {
       "types": "./lib/index.d.ts",

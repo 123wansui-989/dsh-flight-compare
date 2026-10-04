@@ -1,54 +1,22 @@
 /**
- * Pure pricing model for `flight_compare`: the canonical output contract, the
- * offer-to-row aggregation, and the Markdown projection.
+ * Pure comparison model for `flight_compare`: the canonical output contract,
+ * the cross-source aggregation, and the Markdown projection.
  *
- * This module imports nothing, so the aggregation and the rendering can be
- * exercised in isolation.
+ * This module imports only types and small helpers, so the aggregation and the
+ * rendering can be exercised without any network or registry dependency.
  *
  * @module dsh-flight-compare/flight
  */
 
-/** One offer exactly as the Travelpayouts month-matrix endpoint returns it. */
-export interface TravelpayoutsOffer {
-  origin?: string
-  destination?: string
-  price?: number
-  transfers?: number
-  airline?: string
-  flight_number?: number | string
-  departure_at?: string
-  return_at?: string
-  expires_at?: string
-  found_at?: string
-}
-
-/** Envelope shared by every Travelpayouts Data API response. */
-export interface TravelpayoutsEnvelope {
-  success?: boolean
-  data?: TravelpayoutsOffer[] | null
-  error?: string | null
-  currency?: string
-}
-
-/** One aggregated flight/date group. */
-export interface FlightRow {
-  flightNumber: string
-  airline: string
-  date: string
-  departTime: string
-  transfers: number
-  price: number
-  returnAt: string
-  expiresAt: string
-}
+import { isoTime } from './util.js'
+import type { Flight, FlightSourceId } from './sources/types.js'
 
 /**
  * Canonical output contract: the value `execute` returns, and the exact shape
  * the registry validates it against before `render` runs.
  *
  * The value-schema DSL has no `required` keyword, so `execute` declares its
- * return type as {@link FlightCompareValue} to keep every field present — see
- * the explicit signature in `index.ts`.
+ * return type as {@link FlightCompareValue} to keep every field present.
  */
 export const OUTPUT_SCHEMA = {
   type: 'object',
@@ -63,6 +31,21 @@ export const OUTPUT_SCHEMA = {
     total: { type: 'integer' },
     matched: { type: 'integer' },
     truncated: { type: 'boolean' },
+    sources: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          name: { type: 'string' },
+          label: { type: 'string' },
+          ok: { type: 'boolean' },
+          flights: { type: 'integer' },
+          error: { type: 'string' },
+        },
+      },
+    },
+    warnings: { type: 'array', items: { type: 'string' } },
     rows: {
       type: 'array',
       items: {
@@ -70,20 +53,61 @@ export const OUTPUT_SCHEMA = {
         additionalProperties: false,
         properties: {
           flightNumber: { type: 'string' },
-          airline: { type: 'string' },
+          carrier: { type: 'string' },
           date: { type: 'string' },
           departTime: { type: 'string' },
           transfers: { type: 'integer' },
           price: { type: 'number' },
-          returnAt: { type: 'string' },
-          expiresAt: { type: 'string' },
+          currency: { type: 'string' },
+          source: { type: 'string' },
+          otherPrices: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                source: { type: 'string' },
+                price: { type: 'number' },
+                currency: { type: 'string' },
+              },
+            },
+          },
         },
       },
     },
   },
 } as const
 
-/** Canonical aggregated result: the declared `output.schema` shape. */
+/** One competing price for the same flight on the same day. */
+export interface FlightRowOffer {
+  source: FlightSourceId
+  price: number
+  currency: string
+}
+
+/** One aggregated flight/date group: its lowest price, and who offered what. */
+export interface FlightRow {
+  flightNumber: string
+  carrier: string
+  date: string
+  departTime: string
+  transfers: number
+  price: number
+  currency: string
+  source: FlightSourceId
+  otherPrices: FlightRowOffer[]
+}
+
+/** Per-source outcome, so one broken source does not hide the others. */
+export interface SourceOutcome {
+  name: FlightSourceId
+  label: string
+  ok: boolean
+  flights: number
+  error: string
+}
+
+/** Canonical result: the declared `output.schema` shape. */
 export interface FlightCompareValue {
   origin: string
   destination: string
@@ -94,44 +118,88 @@ export interface FlightCompareValue {
   total: number
   matched: number
   truncated: boolean
+  sources: SourceOutcome[]
+  warnings: string[]
   rows: FlightRow[]
 }
 
-/** Normalize a user-supplied IATA code: trim and upper-case. */
-export function normalizeCode(value: string): string {
-  return value.trim().toUpperCase()
+/** Comparison key: flight number + departure date, with carrier as a tiebreaker. */
+function groupKey(flight: Flight): string {
+  return `${flight.flightNumber}\u0000${flight.departDate}`
 }
 
-/** ISO timestamp -> `YYYY-MM-DD`, or an empty string when unusable. */
-export function isoDate(value: string | undefined): string {
-  if (typeof value !== 'string') return ''
-  const match = /^\d{4}-\d{2}-\d{2}/.exec(value)
-  return match?.[0] ?? ''
+/** Project one offer onto the competing-price record kept per source. */
+function offerOf(flight: Flight): FlightRowOffer {
+  return { source: flight.source, price: flight.price, currency: flight.currency }
 }
 
-/** ISO timestamp -> `HH:MM`, or an empty string when unusable. */
-export function isoTime(value: string | undefined): string {
-  if (typeof value !== 'string') return ''
-  const match = /T(\d{2}:\d{2})/.exec(value)
-  return match?.[1] ?? ''
+/** Sort two competing offers: price ascending, then source id for stability. */
+function byPriceThenSource(left: FlightRowOffer, right: FlightRowOffer): number {
+  if (left.price !== right.price) return left.price - right.price
+  return left.source.localeCompare(right.source)
 }
 
-/** `YYYY-MM-01` for a `YYYY-MM`/`YYYY-MM-DD` string, or the string itself. */
-export function monthStart(value: string): string {
-  const match = /^(\d{4})-(\d{2})/.exec(value)
-  return match ? `${match[1]}-${match[2]}-01` : value
-}
+/**
+ * Collapse every source's offers into one row per flight number + departure
+ * date, keeping the lowest price across all sources and recording the winner.
+ *
+ * The winning offer supplies the row's carrier, departure time, and stop count,
+ * so the details always describe the itinerary the lowest price belongs to.
+ * When the same source returns a flight twice at different prices the cheaper
+ * offer wins, so a row never lists one source more than once.
+ *
+ * @param flights - Normalized offers from every source, in any order.
+ * @returns Rows sorted by lowest price ascending, plus the offer count used.
+ */
+export function aggregate(flights: Flight[]): { rows: FlightRow[]; matched: number } {
+  const groups = new Map<string, { bySource: Map<FlightSourceId, FlightRowOffer>; best: Flight }>()
+  let matched = 0
 
-/** `true` when the value is a `YYYY-MM` or `YYYY-MM-DD` string. */
-export function isDateInput(value: string): boolean {
-  return /^\d{4}-\d{2}(-\d{2})?$/.test(value)
-}
+  for (const flight of flights) {
+    if (!Number.isFinite(flight.price) || flight.flightNumber.length === 0 || flight.departDate.length === 0) continue
+    matched += 1
 
-/** Coerce a Travelpayouts flight number to a stable string, or `''`. */
-export function flightNumber(value: number | string | undefined): string {
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
-  if (typeof value === 'string' && value.trim().length > 0) return value.trim()
-  return ''
+    const key = groupKey(flight)
+    const group = groups.get(key)
+    if (group === undefined) {
+      groups.set(key, { bySource: new Map([[flight.source, offerOf(flight)]]), best: flight })
+      continue
+    }
+
+    const previous = group.bySource.get(flight.source)
+    if (previous === undefined || flight.price < previous.price) {
+      group.bySource.set(flight.source, offerOf(flight))
+    }
+    if (flight.price < group.best.price) {
+      group.best = flight
+    }
+  }
+
+  const rows: FlightRow[] = []
+  for (const [key, group] of groups) {
+    const ranked = [...group.bySource.values()].sort(byPriceThenSource)
+    const winner = ranked[0]
+    if (winner === undefined) continue
+    rows.push({
+      flightNumber: key.slice(0, key.indexOf('\u0000')),
+      carrier: group.best.carrier,
+      date: group.best.departDate,
+      departTime: isoTime(group.best.departureAt),
+      transfers: group.best.transfers,
+      price: winner.price,
+      currency: winner.currency,
+      source: winner.source,
+      otherPrices: ranked.slice(1),
+    })
+  }
+
+  rows.sort((left, right) => {
+    if (left.price !== right.price) return left.price - right.price
+    if (left.date !== right.date) return left.date < right.date ? -1 : 1
+    return left.flightNumber.localeCompare(right.flightNumber)
+  })
+
+  return { rows, matched }
 }
 
 /** Human-readable transfer count for the Markdown table. */
@@ -144,101 +212,76 @@ function cell(value: string): string {
   return value.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim()
 }
 
-/**
- * Collapse offers into one row per flight number + departure date, keeping the
- * lowest price and the details of the offer that carried it.
- *
- * @param offers - Raw provider offers.
- * @param departDate - Optional `YYYY-MM-DD` filter.
- * @returns Aggregated rows sorted by price ascending, plus the offer count used.
- */
-export function aggregate(offers: TravelpayoutsOffer[], departDate?: string): { rows: FlightRow[]; matched: number } {
-  const groups = new Map<string, FlightRow>()
-  let matched = 0
-
-  for (const offer of offers) {
-    if (typeof offer.price !== 'number' || !Number.isFinite(offer.price)) continue
-    const number = flightNumber(offer.flight_number)
-    const date = isoDate(offer.departure_at)
-    if (number.length === 0 || date.length === 0) continue
-    if (departDate !== undefined && date !== departDate) continue
-
-    matched += 1
-    const key = `${number}\u0000${date}`
-    const previous = groups.get(key)
-    if (previous === undefined || offer.price < previous.price) {
-      groups.set(key, {
-        flightNumber: number,
-        airline: offer.airline ?? '',
-        date,
-        departTime: isoTime(offer.departure_at),
-        transfers: typeof offer.transfers === 'number' ? offer.transfers : 0,
-        price: offer.price,
-        returnAt: offer.return_at ?? '',
-        expiresAt: offer.expires_at ?? '',
-      })
-    }
-  }
-
-  const rows = [...groups.values()].sort((left, right) => {
-    if (left.price !== right.price) return left.price - right.price
-    if (left.date !== right.date) return left.date < right.date ? -1 : 1
-    return left.flightNumber.localeCompare(right.flightNumber)
-  })
-
-  return { rows, matched }
+/** Render the per-row source attribution, adding competitors when there are any. */
+function sourceLabel(row: FlightRow, labelOf: (source: FlightSourceId) => string): string {
+  const winner = `${labelOf(row.source)} ★`
+  if (row.otherPrices.length === 0) return winner
+  const others = row.otherPrices.map((offer) => `${labelOf(offer.source)} ${offer.price}`).join(' / ')
+  return `${winner}（其他：${others}）`
 }
 
 /**
  * Build the Markdown table a model and a reader both consume.
  *
  * @param args - Validated tool arguments.
- * @param value - Canonical aggregated result.
+ * @param value - Canonical comparison result.
  * @returns One Markdown document.
  */
 export function renderMarkdown(
   args: { origin: string; destination: string; departDate?: string },
   value: FlightCompareValue,
 ): string {
-  const origin = value.origin
-  const destination = value.destination
-  const currency = value.currency
-  const month = value.month
-  const rows = value.rows
-
-  const route = `${origin} → ${destination}`
-  const scope = args.departDate === undefined ? `${month.slice(0, 7)} 整月` : args.departDate
+  const route = `${value.origin} → ${value.destination}`
+  const scope = args.departDate === undefined ? `${value.month.slice(0, 7)} 整月` : args.departDate
+  const labels = new Map(value.sources.map((source) => [source.name, source.label] as const))
+  const labelOf = (source: FlightSourceId): string => labels.get(source) ?? source
   const lines: string[] = []
 
   lines.push(`# ${route} 机票比价`)
   lines.push('')
-  lines.push(`数据源：Travelpayouts（缓存价格）｜出发：${scope}｜币种：${currency}`)
+  lines.push(`数据源：${value.source}｜出发：${scope}｜币种：${value.currency}`)
 
-  if (rows.length === 0) {
+  if (value.sources.length > 0) {
     lines.push('')
-    lines.push('没有找到该航线在所选时间范围内的缓存价格。')
+    for (const source of value.sources) {
+      const status = source.ok ? `${source.flights} 条报价` : `不可用：${source.error}`
+      lines.push(`- ${source.label}（\`${source.name}\`）：${status}`)
+    }
+  }
+
+  if (value.rows.length === 0) {
+    lines.push('')
+    lines.push('没有找到该航线在所选时间范围内的价格。')
     return lines.join('\n')
   }
 
   lines.push('')
-  lines.push('| 航班号 | 航司 | 日期 | 起飞 | 中转 | 价格 |')
-  lines.push('| --- | --- | --- | --- | --- | --- |')
-  for (const row of rows) {
-    const flight = cell(`${row.airline}${row.flightNumber}`)
+  lines.push('| 航班号 | 航司 | 日期 | 起飞 | 中转 | 最低价 | 来源 |')
+  lines.push('| --- | --- | --- | --- | --- | --- | --- |')
+  for (const row of value.rows) {
+    const flight = cell(`${row.carrier}${row.flightNumber}`)
     lines.push(
-      `| ${flight} | ${cell(row.airline) || '-'} | ${row.date} | ${row.departTime || '-'} | ${transfersLabel(row.transfers)} | ${currency} ${row.price} |`,
+      `| ${flight} | ${cell(row.carrier) || '-'} | ${row.date} | ${row.departTime || '-'} | ${transfersLabel(row.transfers)} | ${row.currency} ${row.price} | ${sourceLabel(row, labelOf)} |`,
     )
   }
 
-  const lowest = rows[0]
+  const lowest = value.rows[0]
   if (lowest !== undefined) {
+    const flight = cell(`${lowest.carrier}${lowest.flightNumber}`)
     lines.push('')
-    lines.push(`最低价：**${currency} ${lowest.price}**（${cell(`${lowest.airline}${lowest.flightNumber}`)}，${lowest.date}）`)
+    lines.push(
+      `最低价：**${lowest.currency} ${lowest.price}**（${flight}，${lowest.date}，来源 ${labelOf(lowest.source)}）`,
+    )
   }
   lines.push('')
   lines.push(`共 ${value.total} 组航班/日期，来自 ${value.matched} 条报价。`)
   if (value.truncated) {
-    lines.push(`（结果已截断为 ${rows.length} 行，可通过 maxRows 配置放大上限。）`)
+    lines.push(`（结果已截断为 ${value.rows.length} 行，可通过 maxRows 配置放大上限。）`)
+  }
+  if (value.warnings.length > 0) {
+    lines.push('')
+    lines.push('注意：')
+    for (const warning of value.warnings) lines.push(`- ${warning}`)
   }
   return lines.join('\n')
 }

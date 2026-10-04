@@ -1,14 +1,15 @@
 /**
- * `flight_compare` — compare cached flight prices for one route from Travelpayouts.
+ * `flight_compare` — compare flight prices for one route across sources.
  *
- * The only data source is the Travelpayouts Flight Data Access API
- * (`GET /v2/prices/month-matrix`). The API token is read from the plugin
- * configuration, which `cordis.patch.yml` fills from the
- * `TRAVELPAYOUTS_TOKEN` environment variable — it is never hardcoded.
+ * Two sources are wired in, behind one interface (`sources/types.ts`):
+ * Travelpayouts cached prices (`GET /v2/prices/month-matrix`) and the Amadeus
+ * Self-Service Flight Offers Search API (`GET /v2/shopping/flight-offers`).
+ * Both read their credentials from plugin configuration, which
+ * `cordis.patch.yml` fills from the environment — nothing is hardcoded.
  *
- * Offers are aggregated by flight number + departure date: every offer in a
- * group collapses into the lowest price for that flight on that day. The
- * resulting rows are sorted by price ascending and rendered as a Markdown table.
+ * Every source's offers are normalized to one `Flight` shape, then aggregated
+ * by flight number + departure date with the lowest price across sources
+ * winning. A source that fails is reported instead of failing the whole call.
  *
  * `apply` returns the disposer from `ctx.tools.register`, which Cordis runs when
  * the plugin's fiber disposes.
@@ -19,15 +20,11 @@
 import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import {
-  OUTPUT_SCHEMA,
-  aggregate,
-  isDateInput,
-  monthStart,
-  normalizeCode,
-  renderMarkdown,
-} from './flight.js'
-import type { FlightCompareValue, TravelpayoutsEnvelope, TravelpayoutsOffer } from './flight.js'
+import { OUTPUT_SCHEMA, aggregate, renderMarkdown } from './flight.js'
+import type { FlightCompareValue, SourceOutcome } from './flight.js'
+import { createSources } from './sources/index.js'
+import type { Flight, FlightQuery, FlightSource } from './sources/index.js'
+import { isDateInput, monthStart, normalizeCode } from './util.js'
 
 /** Plugin name used by Cordis (exported so the patch and the manifest agree). */
 export const name = 'dsh-flight-compare'
@@ -37,107 +34,128 @@ export const inject = ['tools']
 
 /** Plugin configuration, validated by Cordis when the row activates. */
 export const Config = Schema.object({
-  /** Travelpayouts API token. Required; supply it through the environment. */
-  token: Schema.string().required().description('Travelpayouts API token (X-Access-Token).'),
-  /** Currency of the returned prices. The API defaults to RUB. */
+  /** Travelpayouts Data Access API token. Required; supply it through the environment. */
+  travelpayoutsToken: Schema.string().required().description('Travelpayouts token (X-Access-Token).'),
+  /**
+   * Legacy alias for {@link Config.travelpayoutsToken}. 0.1.0 rows used `token`;
+   * it is still honored when `travelpayoutsToken` is absent, so upgrading the
+   * package does not break an existing profile patch.
+   */
+  token: Schema.string().description('Deprecated alias of travelpayoutsToken, kept for 0.1.0 rows.'),
+  /** Amadeus Self-Service API key; leave empty to disable that source. */
+  amadeusClientId: Schema.string().default('').description('Amadeus API key (client id).'),
+  /** Amadeus Self-Service API secret; leave empty to disable that source. */
+  amadeusClientSecret: Schema.string().default('').description('Amadeus API secret (client secret).'),
+  /** Use the Amadeus production host instead of the test host. */
+  amadeusProduction: Schema.boolean().default(false).description('Query api.amadeus.com instead of test.api.amadeus.com.'),
+  /** Upper bound on Amadeus offers requested per search. */
+  amadeusMaxResults: Schema.natural().default(20).description('Maximum Amadeus offers per search.'),
+  /** Currency of the returned prices. The Travelpayouts API defaults to RUB. */
   currency: Schema.string().default('RUB').description('ISO currency code for prices, for example RUB or USD.'),
   /** Upper bound on rows in the rendered table. */
   maxRows: Schema.natural().default(30).description('Maximum number of aggregated rows to return.'),
   /** Upstream request timeout in milliseconds. */
-  timeoutMs: Schema.natural().default(20000).description('Travelpayouts request timeout in milliseconds.'),
+  timeoutMs: Schema.natural().default(20000).description('Per-source request timeout in milliseconds.'),
 })
 
 /** Resolved configuration passed to `apply`. */
 export interface FlightCompareConfig {
-  /** Travelpayouts API token sent as `X-Access-Token`. */
-  token: string
+  /** Travelpayouts Data Access API token. */
+  travelpayoutsToken: string
+  /** Legacy 0.1.0 token field, read only when `travelpayoutsToken` is empty. */
+  token?: string
+  /** Amadeus API key; empty disables the Amadeus source. */
+  amadeusClientId: string
+  /** Amadeus API secret; empty disables the Amadeus source. */
+  amadeusClientSecret: string
+  /** Use the Amadeus production host. */
+  amadeusProduction: boolean
+  /** Upper bound on Amadeus offers requested per search. */
+  amadeusMaxResults: number
   /** Currency of the returned prices. */
   currency: string
   /** Upper bound on rows in the rendered table. */
   maxRows: number
-  /** Upstream request timeout in milliseconds. */
+  /** Per-source request timeout in milliseconds. */
   timeoutMs: number
 }
 
-/** Travelpayouts month-matrix endpoint — the plugin's only data source. */
-const API_BASE = 'https://api.travelpayouts.com/v2/prices/month-matrix'
-
 /**
- * Fetch the cached month matrix for one route.
+ * Query one source, converting any failure into a reported outcome.
  *
- * @param origin - IATA code of the departure city.
- * @param destination - IATA code of the destination city.
- * @param month - First day of the requested month (`YYYY-MM-DD`).
- * @param config - Resolved plugin configuration.
- * @param signal - Caller cancellation signal, forwarded to the request.
- * @returns The offers the provider returned for that month.
- * @throws Error when the provider answers with a non-2xx status or an error envelope.
+ * @param source - The source to query.
+ * @param query - Normalized route, date filter, currency, and cancellation signal.
+ * @returns The source's flights plus its outcome row.
  */
-async function fetchMonthMatrix(
-  origin: string,
-  destination: string,
-  month: string,
-  config: FlightCompareConfig,
-  signal: AbortSignal,
-): Promise<TravelpayoutsOffer[]> {
-  const url = new URL(API_BASE)
-  url.searchParams.set('origin', origin)
-  url.searchParams.set('destination', destination)
-  url.searchParams.set('month', month)
-  url.searchParams.set('currency', config.currency)
-  url.searchParams.set('show_to_affiliates', 'true')
-
-  const timeout = AbortSignal.timeout(config.timeoutMs)
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      accept: 'application/json',
-      'x-access-token': config.token,
-    },
-    signal: AbortSignal.any([signal, timeout]),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Travelpayouts request failed with HTTP ${response.status} ${response.statusText}`)
+async function collect(
+  source: FlightSource,
+  query: FlightQuery,
+): Promise<{ flights: Flight[]; outcome: SourceOutcome }> {
+  try {
+    const flights = await source.search(query)
+    return { flights, outcome: { name: source.name, label: source.label, ok: true, flights: flights.length, error: '' } }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    return { flights: [], outcome: { name: source.name, label: source.label, ok: false, flights: 0, error: reason } }
   }
-
-  const payload = (await response.json()) as TravelpayoutsEnvelope
-  if (payload.success === false || payload.error) {
-    throw new Error(`Travelpayouts rejected the request: ${payload.error ?? 'unknown error'}`)
-  }
-  if (!Array.isArray(payload.data)) return []
-  return payload.data
 }
 
 /**
- * Register `flight_compare` on the Cordis context.
+ * Build one source query, omitting `departDate` when the caller did not pin a
+ * day (`exactOptionalPropertyTypes` treats an explicit `undefined` as a value).
  *
- * @param ctx - Cordis context providing the `tools` service.
- * @param config - Resolved plugin configuration.
- * @returns The disposer that unregisters the tool.
+ * @param input - Route, optional day filter, month anchor, currency, and signal.
+ * @returns A query every source accepts.
  */
+function buildQuery(input: {
+  origin: string
+  destination: string
+  departDate: string | undefined
+  month: string
+  currency: string
+  signal: AbortSignal
+}): FlightQuery {
+  const { departDate, ...rest } = input
+  return departDate === undefined ? rest : { ...rest, departDate }
+}
+
+/** Register `flight_compare` on the Cordis context. */
 export function apply(ctx: Context, config: FlightCompareConfig): () => void {
   const maxRows = Math.max(1, Math.trunc(config.maxRows))
   const currency = config.currency.trim().toUpperCase() || 'RUB'
+  const travelpayoutsToken = config.travelpayoutsToken.trim() || (config.token ?? '').trim()
+  if (travelpayoutsToken.length === 0) {
+    throw new Error('no Travelpayouts token configured: set travelpayoutsToken (or the legacy token) on the plugin row')
+  }
+  const sources = createSources({
+    travelpayoutsToken,
+    amadeusClientId: config.amadeusClientId.trim(),
+    amadeusClientSecret: config.amadeusClientSecret.trim(),
+    amadeusProduction: config.amadeusProduction,
+    amadeusMaxResults: Math.max(1, Math.trunc(config.amadeusMaxResults)),
+    timeoutMs: config.timeoutMs,
+  })
+  const sourceSummary = sources.map((source) => source.label).join(' + ')
 
   const tool = defineTool({
     name: 'flight_compare',
     description:
-      'Compare cached flight prices for one route with Travelpayouts and return the lowest price per flight number and departure date, sorted by price ascending.',
+      'Compare flight prices for one route across Travelpayouts and Amadeus, and return the lowest price per flight number and departure date with the source that offered it, sorted by price ascending.',
     parameters: {
       origin: {
         type: 'string',
         required: true,
-        description: 'IATA code of the departure city, for example MOW or PEK.',
+        description: 'IATA code of the departure city or airport, for example MOW or PEK.',
       },
       destination: {
         type: 'string',
         required: true,
-        description: 'IATA code of the destination city, for example HKT or BCN.',
+        description: 'IATA code of the destination city or airport, for example HKT or BCN.',
       },
       departDate: {
         type: 'string',
-        description: 'Optional departure filter: YYYY-MM for a month or YYYY-MM-DD for a single day.',
+        description:
+          'Departure date: YYYY-MM-DD for one day, or YYYY-MM for a whole month. Defaults to today. Amadeus needs a day, so a whole-month request only compares Travelpayouts.',
       },
     },
     output: {
@@ -158,12 +176,24 @@ export function apply(ctx: Context, config: FlightCompareConfig): () => void {
         throw new Error(`departDate must be YYYY-MM or YYYY-MM-DD, received "${args.departDate}"`)
       }
       const requested = rawDate !== undefined && rawDate.length > 0 ? rawDate : undefined
-      const month = monthStart(requested ?? new Date().toISOString().slice(0, 7))
-      // `YYYY-MM` selects the month to query; only a `YYYY-MM-DD` narrows to one day.
+      // Older builds made `departDate` optional, so an absent value still works:
+      // it anchors on today and queries the whole month.
       const departDate = requested !== undefined && requested.length === 10 ? requested : undefined
+      const anchorDate = departDate ?? new Date().toISOString().slice(0, 10)
+      const month = monthStart(anchorDate)
 
-      const offers = await fetchMonthMatrix(origin, destination, month, { ...config, currency }, exec.signal)
-      const { rows, matched } = aggregate(offers, departDate)
+      const results = await Promise.all(
+        sources.map((source) => collect(source, buildQuery({ origin, destination, departDate, month, currency, signal: exec.signal }))),
+      )
+
+      const flights = results.flatMap((result) => result.flights)
+      const outcomes = results.map((result) => result.outcome)
+      const warnings = outcomes.filter((outcome) => !outcome.ok).map((outcome) => `${outcome.label} 查询失败：${outcome.error}`)
+      if (departDate === undefined) {
+        warnings.push('未指定具体日期，只按整月与 Travelpayouts 比对；Amadeus 需要 YYYY-MM-DD 才能查询。')
+      }
+
+      const { rows, matched } = aggregate(flights)
       const truncated = rows.length > maxRows
 
       return {
@@ -172,10 +202,12 @@ export function apply(ctx: Context, config: FlightCompareConfig): () => void {
         month,
         departDate: departDate ?? '',
         currency,
-        source: 'travelpayouts',
+        source: sourceSummary,
         total: rows.length,
         matched,
         truncated,
+        sources: outcomes,
+        warnings,
         rows: rows.slice(0, maxRows),
       }
     },
